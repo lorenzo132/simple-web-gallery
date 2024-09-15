@@ -37,12 +37,9 @@ async function listMedia() {
 
         for (const file of fileList) {
             const ext = path.extname(file.name).toLowerCase();
-            // Added .webp as a supported image format
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/media/${encodeURIComponent(file.name)}`; // URL for media route
+                const fileUrl = `/media/${encodeURIComponent(file.name)}`;
                 const fileStat = await sftp.stat(path.join(SFTP_DIR, file.name));
-
-                // Handle the modification time (mtime) properly
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
                     uploadDate = 'Unknown Date';
@@ -56,7 +53,6 @@ async function listMedia() {
             }
         }
 
-        // Sort by upload date (most recent first)
         mediaItems.sort((a, b) => (a.uploadDate instanceof Date && b.uploadDate instanceof Date) ? b.uploadDate - a.uploadDate : 0);
 
         return mediaItems;
@@ -111,6 +107,7 @@ const galleryTemplate = (media) => `
             display: flex;
             flex-direction: column;
             align-items: center;
+            cursor: pointer;
         }
         .gallery-item img {
             display: block;
@@ -148,12 +145,43 @@ const galleryTemplate = (media) => `
             text-align: center;
             text-decoration: none;
             border-radius: 5px;
-            width: calc(100% - 20px); /* Adjust width to fit within the gallery item */
+            width: calc(100% - 20px);
             font-size: 14px;
             box-sizing: border-box;
         }
         .download-button:hover {
             background: #0056b3;
+        }
+        .fullscreen {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .fullscreen img {
+            max-width: 90%;
+            max-height: 90%;
+        }
+        .fullscreen video {
+            max-width: 90%;
+            max-height: 90%;
+        }
+        .fullscreen:target {
+            display: flex;
+        }
+        .fullscreen-close {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
         }
     </style>
 </head>
@@ -163,8 +191,9 @@ const galleryTemplate = (media) => `
         ${media.map(({ url, size, uploadDate }) => {
             const dateStr = uploadDate instanceof Date ? uploadDate.toDateString() : 'Unknown Date';
             const isVideo = url.endsWith('.mp4') || url.endsWith('.avi') || url.endsWith('.mov');
+            const fileName = path.basename(url);
             return `
-            <div class="gallery-item">
+            <div class="gallery-item" onclick="openFullscreen('${fileName}')">
                 ${isVideo ? 
                     `<video src="${url}" controls></video>` : 
                     `<img src="${url}" alt="Image" />`
@@ -172,9 +201,25 @@ const galleryTemplate = (media) => `
                 <div class="info">Size: ${size} bytes<br>Uploaded: ${dateStr}</div>
                 <a href="${url}" download class="download-button">Download</a>
             </div>
+            <div id="fullscreen-${fileName}" class="fullscreen">
+                <span class="fullscreen-close" onclick="closeFullscreen()">×</span>
+                ${isVideo ? 
+                    `<video src="${url}" controls autoplay></video>` : 
+                    `<img src="${url}" alt="Fullscreen Image" />`
+                }
+            </div>
             `;
         }).join('')}
     </div>
+
+    <script>
+        function openFullscreen(fileName) {
+            document.getElementById('fullscreen-' + fileName).style.display = 'flex';
+        }
+        function closeFullscreen() {
+            document.querySelectorAll('.fullscreen').forEach(el => el.style.display = 'none');
+        }
+    </script>
 </body>
 </html>
 `;
@@ -188,18 +233,9 @@ app.get('/media/:filename', async (req, res) => {
         const remoteFilePath = path.join(SFTP_DIR, filename);
         const sftpStream = await sftp.get(remoteFilePath);
 
-        if (Buffer.isBuffer(sftpStream)) {
-            const stream = new PassThrough();
-            stream.end(sftpStream);
-
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-            stream.pipe(res);
-        } else {
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-            sftpStream.pipe(res);
-        }
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+        sftpStream.pipe(res);
 
     } catch (error) {
         console.error(error);
