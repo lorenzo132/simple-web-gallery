@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
-const mime = require('mime-types'); // For detecting MIME type
+const mime = require('mime-types'); // For detecting MIME types
 const app = express();
 
 // Load environment variables from .env file
@@ -24,10 +24,13 @@ const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
 // Local video storage directory
 const LOCAL_VIDEO_DIR = 'local_videos/';
 
+// Upload limit from environment variable (default to 700 MB)
+const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
+
 // Configure multer to store files in a specific directory
 const upload = multer({
     dest: LOCAL_VIDEO_DIR, // Directory to store uploaded files
-    limits: { fileSize: 100 * 1024 * 1024 } // Limit file size to 100 MB
+    limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } // Limit file size to configured limit
 });
 
 // Ensure local video directory exists
@@ -265,7 +268,7 @@ const galleryTemplate = (media) => `
                 <span class="fullscreen-close" onclick="closeFullscreen()">×</span>
                 ${isVideo ? 
                     `<video src="${url}" controls autoplay></video>` : 
-                    `<img src="${url}" alt="Fullscreen Image" />`
+                    `<img src="${url}" alt="Image" />`
                 }
             </div>
             `;
@@ -393,8 +396,7 @@ app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
     const filePath = path.join(LOCAL_VIDEO_DIR, req.file.filename);
     const fileBuffer = fs.readFileSync(filePath);
     const mimeType = mime.lookup(req.file.originalname) || 'video/mp4'; // Default to mp4 if type cannot be detected
-    const ext = mime.extension(mimeType) || 'mp4'; // Default to mp4 if extension cannot be detected
-    const newFilePath = path.join(LOCAL_VIDEO_DIR, `${req.file.filename}.${ext}`);
+    const newFilePath = path.join(LOCAL_VIDEO_DIR, `${req.file.filename}${mime.extension(mimeType) ? '.' + mime.extension(mimeType) : '.mp4'}`);
 
     fs.renameSync(filePath, newFilePath);
 
