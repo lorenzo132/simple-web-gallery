@@ -65,12 +65,11 @@ async function createSFTPConnection() {
     return sftp;
 }
 
-// Function to list media files from both SFTP and local directories
-async function listMedia() {
+// Function to list media files from the SFTP server
+async function listMediaFromSFTP() {
     let sftp;
     const mediaItems = [];
     try {
-        // List files from SFTP
         sftp = await createSFTPConnection();
         const sftpFileList = await sftp.list(SFTP_DIR);
 
@@ -79,28 +78,6 @@ async function listMedia() {
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/media/${encodeURIComponent(file.name)}`;
                 const fileStat = await sftp.stat(path.join(SFTP_DIR, file.name));
-                let uploadDate = new Date(fileStat.mtime);
-                if (isNaN(uploadDate)) {
-                    uploadDate = 'Unknown Date';
-                }
-
-                mediaItems.push({
-                    url: fileUrl,
-                    size: fileStat.size,
-                    uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
-                });
-            }
-        }
-
-        // List files from local directory
-        const localFileList = fs.readdirSync(LOCAL_VIDEO_DIR);
-
-        for (const file of localFileList) {
-            const ext = path.extname(file).toLowerCase();
-            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/local/${encodeURIComponent(file)}`;
-                const filePath = path.join(LOCAL_VIDEO_DIR, file);
-                const fileStat = fs.statSync(filePath);
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
                     uploadDate = 'Unknown Date';
@@ -297,7 +274,7 @@ function galleryTemplate(media) {
 
 // Serve gallery
 app.get('/', async (req, res) => {
-    const media = await listMedia();
+    const media = await listMediaFromSFTP();
     res.send(galleryTemplate(media));
 });
 
@@ -328,7 +305,7 @@ app.get('/media/:filename', async (req, res) => {
 });
 
 // Handle file uploads
-app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
+app.post('/upload', ipRestrict, upload.single('video'), (req, res) => {
     res.send('File uploaded successfully');
 });
 
