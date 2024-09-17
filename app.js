@@ -6,7 +6,7 @@ const fs = require('fs');
 const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
 const mime = require('mime-types'); // For detecting MIME types
-const { createClient } = require('@nextcloud/webdav'); // Use dynamic import for ES module
+const { createClient } = require('webdav'); // Correct import for webdav
 const app = express();
 
 // Load environment variables from .env file
@@ -124,7 +124,7 @@ async function listMedia() {
             const ext = path.extname(file.name).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/nextcloud/${encodeURIComponent(file.name)}`;
-                const fileStat = await client.stat(path.join(NEXTCLOUD_DIR, file.name));
+                const fileStat = await client.getStats(path.join(NEXTCLOUD_DIR, file.name));
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
                     uploadDate = 'Unknown Date';
@@ -261,15 +261,12 @@ const galleryTemplate = (media) => `
             max-width: 90%;
             max-height: 90%;
         }
-        .fullscreen:target {
-            display: flex;
-        }
         .fullscreen-close {
             position: absolute;
             top: 20px;
             right: 20px;
-            color: white;
             font-size: 24px;
+            color: white;
             cursor: pointer;
         }
     </style>
