@@ -277,10 +277,10 @@ function galleryTemplate(media) {
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 1000;
-            justify-content: center;
+            background: rgba(0, 0, 0, 0.8);
             align-items: center;
+            justify-content: center;
+            z-index: 1000;
         }
         .fullscreen img, .fullscreen video {
             max-width: 90%;
@@ -346,4 +346,5 @@ function galleryTemplate(media) {
     </script>
 </body>
 </html>
-`;
+    `;
+}
