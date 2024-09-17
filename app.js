@@ -3,7 +3,6 @@ const multer = require('multer');
 const SFTPClient = require('ssh2-sftp-client');
 const path = require('path');
 const fs = require('fs');
-const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
 const mime = require('mime-types'); // For detecting MIME types
 const app = express();
@@ -18,24 +17,24 @@ const SFTP_USER = process.env.SFTP_USER;
 const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
 const SFTP_DIR = process.env.SFTP_DIR || '/';
 
-// Allowed IP address for uploading videos
-const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
+// Allowed IP address for uploading videos and creating folders
+const ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
 
 // Local video storage directory
-const LOCAL_VIDEO_DIR = 'local_videos/';
+const LOCAL_MEDIA_DIR = 'local_media/';
 
 // Upload limit from environment variable (default to 700 MB)
 const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
 
 // Configure multer to store files in a specific directory
 const upload = multer({
-    dest: LOCAL_VIDEO_DIR, // Directory to store uploaded files
+    dest: LOCAL_MEDIA_DIR, // Directory to store uploaded files
     limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } // Limit file size to configured limit
 });
 
-// Ensure local video directory exists
-if (!fs.existsSync(LOCAL_VIDEO_DIR)){
-    fs.mkdirSync(LOCAL_VIDEO_DIR);
+// Ensure local media directory exists
+if (!fs.existsSync(LOCAL_MEDIA_DIR)) {
+    fs.mkdirSync(LOCAL_MEDIA_DIR);
 }
 
 // Trust the X-Forwarded-For header to get the correct client IP if using a proxy
@@ -44,9 +43,7 @@ app.set('trust proxy', true);
 // Middleware to check IP address for uploads and folder creation
 function ipRestrict(req, res, next) {
     const clientIp = req.ip;
-    console.log(`Client IP: ${clientIp}`);
-    
-    if (clientIp === UPLOAD_ALLOWED_IP) {
+    if (clientIp === ALLOWED_IP) {
         next();
     } else {
         res.status(403).send('Forbidden: You are not allowed to perform this action.');
@@ -93,13 +90,13 @@ async function listMedia() {
         }
 
         // List files from local directory
-        const localFileList = fs.readdirSync(LOCAL_VIDEO_DIR);
+        const localFileList = fs.readdirSync(LOCAL_MEDIA_DIR);
 
         for (const file of localFileList) {
             const ext = path.extname(file).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/local/${encodeURIComponent(file)}`;
-                const filePath = path.join(LOCAL_VIDEO_DIR, file);
+                const filePath = path.join(LOCAL_MEDIA_DIR, file);
                 const fileStat = fs.statSync(filePath);
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
@@ -129,7 +126,7 @@ async function listMedia() {
 
 // Serve static files
 app.use(express.static('public'));
-app.use('/local', express.static(LOCAL_VIDEO_DIR));
+app.use('/local', express.static(LOCAL_MEDIA_DIR));
 app.use(express.urlencoded({ extended: true }));
 
 // Define the HTML template for the gallery
@@ -172,13 +169,7 @@ const galleryTemplate = (media) => `
             align-items: center;
             cursor: pointer;
         }
-        .gallery-item img {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .gallery-item video {
+        .gallery-item img, .gallery-item video {
             display: block;
             width: 100%;
             height: auto;
@@ -227,11 +218,7 @@ const galleryTemplate = (media) => `
             justify-content: center;
             align-items: center;
         }
-        .fullscreen img {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen video {
+        .fullscreen img, .fullscreen video {
             max-width: 90%;
             max-height: 90%;
         }
@@ -314,7 +301,7 @@ app.post('/create-folder', ipRestrict, (req, res) => {
         return res.status(400).send('Folder name is required.');
     }
 
-    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
 
     // Check if folder already exists
     if (fs.existsSync(folderPath)) {
@@ -333,7 +320,7 @@ app.post('/create-folder', ipRestrict, (req, res) => {
 });
 
 // Route to serve media files from local directory
-app.use('/local', express.static(LOCAL_VIDEO_DIR));
+app.use('/local', express.static(LOCAL_MEDIA_DIR));
 
 // Start the server
 const PORT = process.env.PORT || 3000;
