@@ -1,305 +1,207 @@
+require('dotenv').config();
 const express = require('express');
-const multer = require('multer');
-const SFTPClient = require('ssh2-sftp-client');
-const path = require('path');
 const fs = require('fs');
-const { PassThrough } = require('stream');
-const dotenv = require('dotenv');
-const mime = require('mime-types'); // For detecting MIME types
-const { Client } = require('nextcloud-node-client'); // For Nextcloud integration
+const path = require('path');
+const mime = require('mime-types');
+const multer = require('multer');
+const { createClient } = require('webdav');
 const app = express();
 
-// Load environment variables from .env file
-dotenv.config();
+// Middleware for handling file uploads (up to 700MB)
+const upload = multer({ limits: { fileSize: 700 * 1024 * 1024 } });
 
-// SFTP configuration from environment variables
-const SFTP_HOST = process.env.SFTP_HOST;
-const SFTP_PORT = process.env.SFTP_PORT || 22;
-const SFTP_USER = process.env.SFTP_USER;
-const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
-const SFTP_DIR = process.env.SFTP_DIR || '/';
-
-// Nextcloud configuration from environment variables
-const NEXTCLOUD_HOST = process.env.NEXTCLOUD_HOST;
-const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER;
-const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD;
-const NEXTCLOUD_DIR = process.env.NEXTCLOUD_DIR || '/';
-
-// Allowed IP address for uploading and managing folders
-const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
-
-// Local video storage directory
-const LOCAL_VIDEO_DIR = 'local_videos/';
-
-// Upload limit from environment variable (default to 700 MB)
-const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
-
-// Configure multer to store files in a specific directory
-const upload = multer({
-    dest: LOCAL_VIDEO_DIR, // Directory to store uploaded files
-    limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } // Limit file size to configured limit
-});
-
-// Ensure local video directory exists
-if (!fs.existsSync(LOCAL_VIDEO_DIR)){
-    fs.mkdirSync(LOCAL_VIDEO_DIR);
-}
-
-// Trust the X-Forwarded-For header to get the correct client IP if using a proxy
-app.set('trust proxy', true);
-
-// Middleware to check IP address for uploads and folder management
+// Restrict access to a specific IP
+const allowedIP = process.env.UPLOAD_ALLOWED_IP; // Set this to your allowed IP
 function ipRestrict(req, res, next) {
-    const clientIp = req.ip;
-    console.log(`Client IP: ${clientIp}`);
-    
-    if (clientIp === UPLOAD_ALLOWED_IP) {
-        next();
-    } else {
-        res.status(403).send('Forbidden: You are not allowed to manage folders.');
+    if (req.ip !== allowedIP) {
+        return res.status(403).send('Access denied.');
     }
+    next();
 }
 
-// Function to create a new SFTP client connection
-async function createSFTPConnection() {
-    const sftp = new SFTPClient();
-    await sftp.connect({
-        host: SFTP_HOST,
-        port: SFTP_PORT,
-        username: SFTP_USER,
-        password: SFTP_PASSWORD
-    });
-    return sftp;
-}
+// Serve static files from local media directory
+app.use('/media', express.static(process.env.LOCAL_MEDIA_DIR));
+app.use('/videos', express.static(process.env.LOCAL_VIDEO_DIR));
 
-// Function to create a Nextcloud client connection
+// Create Nextcloud WebDAV client
 function createNextcloudClient() {
-    const client = new Client({
-        url: NEXTCLOUD_HOST,
-        username: NEXTCLOUD_USER,
-        password: NEXTCLOUD_PASSWORD,
+    return createClient(process.env.NEXTCLOUD_URL, {
+        username: process.env.NEXTCLOUD_USER,
+        password: process.env.NEXTCLOUD_PASSWORD
     });
-    return client;
 }
 
-// Function to list media files from SFTP, local, and Nextcloud directories
-async function listMedia(folder = '') {
-    let sftp, nextcloudClient;
+// List local media files
+function listLocalMedia() {
     const mediaItems = [];
+    const files = fs.readdirSync(process.env.LOCAL_MEDIA_DIR);
+    
+    files.forEach(file => {
+        const ext = path.extname(file).toLowerCase();
+        if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
+            const stats = fs.statSync(path.join(process.env.LOCAL_MEDIA_DIR, file));
+            const uploadDate = stats.mtime;
+            const fileUrl = `/media/${encodeURIComponent(file)}`;
+
+            mediaItems.push({
+                url: fileUrl,
+                size: stats.size,
+                uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
+            });
+        }
+    });
+    
+    return mediaItems;
+}
+
+// List Nextcloud media files
+async function listNextcloudMedia() {
+    const nextcloudClient = createNextcloudClient();
+    const mediaItems = [];
+    
     try {
-        // List files from SFTP
-        sftp = await createSFTPConnection();
-        const sftpFileList = await sftp.list(path.join(SFTP_DIR, folder));
-
-        for (const file of sftpFileList) {
-            const ext = path.extname(file.name).toLowerCase();
-            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/media/${encodeURIComponent(file.name)}`;
-                const fileStat = await sftp.stat(path.join(SFTP_DIR, folder, file.name));
-                let uploadDate = new Date(fileStat.mtime);
-                if (isNaN(uploadDate)) {
-                    uploadDate = 'Unknown Date';
-                }
-
-                mediaItems.push({
-                    url: fileUrl,
-                    size: fileStat.size,
-                    uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
-                });
-            }
-        }
-
-        // List files from local directory
-        const localFileList = fs.readdirSync(path.join(LOCAL_VIDEO_DIR, folder));
-
-        for (const file of localFileList) {
-            const ext = path.extname(file).toLowerCase();
-            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/local/${encodeURIComponent(file)}`;
-                const filePath = path.join(LOCAL_VIDEO_DIR, folder, file);
-                const fileStat = fs.statSync(filePath);
-                let uploadDate = new Date(fileStat.mtime);
-                if (isNaN(uploadDate)) {
-                    uploadDate = 'Unknown Date';
-                }
-
-                mediaItems.push({
-                    url: fileUrl,
-                    size: fileStat.size,
-                    uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
-                });
-            }
-        }
-
-        // List files from Nextcloud
-        nextcloudClient = createNextcloudClient();
-        const nextcloudFileList = await nextcloudClient.getFolderContents(NEXTCLOUD_DIR + folder);
+        const nextcloudFileList = await nextcloudClient.getDirectoryContents(process.env.NEXTCLOUD_DIR);
 
         for (const file of nextcloudFileList) {
-            const ext = path.extname(file.name).toLowerCase();
+            const ext = path.extname(file.basename).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/nextcloud/${encodeURIComponent(file.name)}`;
+                const fileUrl = `/nextcloud/${encodeURIComponent(file.basename)}`;
+                const uploadDate = new Date(file.lastmod);
+
                 mediaItems.push({
                     url: fileUrl,
                     size: file.size,
-                    uploadDate: file.lastModifiedDate || 'Unknown Date'
+                    uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
                 });
             }
         }
 
-        mediaItems.sort((a, b) => (a.uploadDate instanceof Date && b.uploadDate instanceof Date) ? b.uploadDate - a.uploadDate : 0);
-
         return mediaItems;
     } catch (error) {
-        console.error(error);
+        console.error('Error listing Nextcloud media:', error);
         return [];
-    } finally {
-        if (sftp) {
-            await sftp.end();
-        }
     }
 }
 
-// Serve static files
-app.use(express.static('public'));
-app.use('/local', express.static(LOCAL_VIDEO_DIR));
-app.use(express.urlencoded({ extended: true }));
-
-// Template for gallery page with folder management buttons
-function galleryTemplate(media, showFolderButtons) {
-    let html = `
-        <h1>Media Gallery</h1>
-        <div>
-            ${media.map(item => `
-                <div>
-                    <a href="${item.url}">${item.url.split('/').pop()}</a>
-                    <p>Size: ${item.size} bytes, Uploaded: ${item.uploadDate}</p>
-                </div>
-            `).join('')}
-        </div>
-    `;
-
-    if (showFolderButtons) {
-        html += `
-            <h2>Manage Folders</h2>
-            <form action="/create-folder" method="POST">
-                <label for="folderName">New Folder Name:</label>
-                <input type="text" id="folderName" name="folderName" required>
-                <button type="submit">Create Folder</button>
-            </form>
-            <form action="/delete-folder" method="POST">
-                <label for="folderName">Delete Folder Name:</label>
-                <input type="text" id="folderName" name="folderName" required>
-                <button type="submit">Delete Folder</button>
-            </form>
-        `;
-    }
-
-    return html;
-}
-
-// Route to handle local video streaming with range requests
-app.get('/local/:filename', (req, res) => {
+// Serve media files from Nextcloud
+app.get('/nextcloud/:filename', async (req, res) => {
     const { filename } = req.params;
-    const filePath = path.join(LOCAL_VIDEO_DIR, filename);
+    const nextcloudClient = createNextcloudClient();
     
-    fs.stat(filePath, (err, stats) => {
-        if (err) {
-            res.status(404).send('Not Found');
-            return;
-        }
+    try {
+        const remoteFilePath = path.join(process.env.NEXTCLOUD_DIR, filename);
+        const fileStream = await nextcloudClient.createReadStream(remoteFilePath);
 
-        const fileSize = stats.size;
-        const range = req.headers.range;
-        
-        if (range) {
-            const [start, end] = range.replace(/bytes=/, "").split("-").map(Number);
-            const chunkSize = (end - start) + 1;
-            const fileStream = fs.createReadStream(filePath, { start, end });
-
-            res.writeHead(206, {
-                "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-                "Accept-Ranges": "bytes",
-                "Content-Length": chunkSize,
-                "Content-Type": "video/mp4"
-            });
-
-            fileStream.pipe(res);
-        } else {
-            res.writeHead(200, {
-                "Content-Length": fileSize,
-                "Content-Type": "video/mp4"
-            });
-
-            fs.createReadStream(filePath).pipe(res);
-        }
-    });
+        res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+        res.setHeader('Content-Type', mime.lookup(filename) || 'application/octet-stream');
+        fileStream.pipe(res);
+    } catch (error) {
+        console.error('Error serving Nextcloud file:', error);
+        res.status(500).send('Error retrieving file.');
+    }
 });
 
-// Route to list folders and media, showing folder management buttons only for allowed IPs
-app.get('/', async (req, res) => {
-    const clientIp = req.ip;
-    const showFolderButtons = clientIp === UPLOAD_ALLOWED_IP;
-    const media = await listMedia();
-    res.send(galleryTemplate(media, showFolderButtons));
+// Combine media from all sources (Local, Nextcloud)
+async function listMedia() {
+    let localMedia = [], nextcloudMedia = [];
+    
+    // List files from Local and Nextcloud
+    localMedia = listLocalMedia();
+    nextcloudMedia = await listNextcloudMedia();
+
+    // Combine media from all sources and sort by upload date
+    const allMedia = [...localMedia, ...nextcloudMedia];
+    allMedia.sort((a, b) => (a.uploadDate instanceof Date && b.uploadDate instanceof Date) ? b.uploadDate - a.uploadDate : 0);
+
+    return allMedia;
+}
+
+// Gallery endpoint to show media list
+app.get('/gallery', async (req, res) => {
+    try {
+        const mediaList = await listMedia();
+        res.json(mediaList);
+    } catch (error) {
+        res.status(500).send('Error retrieving media list.');
+    }
 });
 
-// Route to create new folders
-app.post('/create-folder', ipRestrict, (req, res) => {
-    const folderName = req.body.folderName;
+// Upload handler for Nextcloud
+async function uploadToNextcloud(file) {
+    const nextcloudClient = createNextcloudClient();
+    const remoteFilePath = path.join(process.env.NEXTCLOUD_DIR, file.originalname);
 
-    // Create folder locally
-    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    try {
+        const fileBuffer = fs.readFileSync(file.path);
+        await nextcloudClient.putFileContents(remoteFilePath, fileBuffer, { overwrite: true });
+        console.log(`File uploaded to Nextcloud: ${remoteFilePath}`);
+    } catch (error) {
+        console.error('Error uploading to Nextcloud:', error);
+    }
+}
+
+// File upload endpoint
+app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).send('No file uploaded.');
+    }
+
+    const filePath = path.join(process.env.LOCAL_VIDEO_DIR, req.file.filename);
+    const fileBuffer = fs.readFileSync(filePath);
+    const mimeType = mime.lookup(req.file.originalname) || 'video/mp4';
+    const newFilePath = path.join(process.env.LOCAL_VIDEO_DIR, `${req.file.filename}.${mime.extension(mimeType) || 'mp4'}`);
+    fs.renameSync(filePath, newFilePath);
+
+    // Upload to Nextcloud (optional)
+    await uploadToNextcloud(req.file);
+
+    res.send('Upload successful.');
+});
+
+// Function to create a folder locally
+function createLocalFolder(folderName) {
+    const folderPath = path.join(process.env.LOCAL_MEDIA_DIR, folderName);
     if (!fs.existsSync(folderPath)) {
-        fs.mkdirSync(folderPath);
+        fs.mkdirSync(folderPath, { recursive: true });
+        console.log(`Local folder created: ${folderPath}`);
+    } else {
+        console.log(`Local folder already exists: ${folderPath}`);
+    }
+}
+
+// Function to create a folder on Nextcloud
+async function createNextcloudFolder(folderName) {
+    const nextcloudClient = createNextcloudClient();
+    const remoteFolderPath = path.join(process.env.NEXTCLOUD_DIR, folderName);
+    
+    try {
+        await nextcloudClient.createDirectory(remoteFolderPath);
+        console.log(`Nextcloud folder created: ${remoteFolderPath}`);
+    } catch (error) {
+        console.error('Error creating Nextcloud folder:', error);
+    }
+}
+
+// Endpoint to create a folder
+app.post('/create-folder', ipRestrict, express.json(), async (req, res) => {
+    const { folderName, storage } = req.body; // storage can be 'local' or 'nextcloud'
+    
+    if (!folderName || !storage) {
+        return res.status(400).send('Folder name and storage type required.');
     }
 
-    // Create folder in SFTP and Nextcloud if applicable
-    (async () => {
-        try {
-            const sftp = await createSFTPConnection();
-            await sftp.mkdir(path.join(SFTP_DIR, folderName));
-            sftp.end();
-
-            const nextcloudClient = createNextcloudClient();
-            await nextcloudClient.createFolder(NEXTCLOUD_DIR + folderName);
-        } catch (error) {
-            console.error(error);
-        }
-    })();
-
-    res.redirect('/');
-});
-
-// Route to delete folders
-app.post('/delete-folder', ipRestrict, (req, res) => {
-    const folderName = req.body.folderName;
-
-    // Delete folder locally
-    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
-    if (fs.existsSync(folderPath)) {
-        fs.rmdirSync(folderPath, { recursive: true });
+    if (storage === 'local') {
+        createLocalFolder(folderName);
+        res.send('Local folder created.');
+    } else if (storage === 'nextcloud') {
+        await createNextcloudFolder(folderName);
+        res.send('Nextcloud folder created.');
+    } else {
+        res.status(400).send('Invalid storage type.');
     }
-
-    // Delete folder in SFTP and Nextcloud if applicable
-    (async () => {
-        try {
-            const sftp = await createSFTPConnection();
-            await sftp.rmdir(path.join(SFTP_DIR, folderName), true);
-            sftp.end();
-
-            const nextcloudClient = createNextcloudClient();
-            await nextcloudClient.deleteFolder(NEXTCLOUD_DIR + folderName);
-        } catch (error) {
-            console.error(error);
-        }
-    })();
-
-    res.redirect('/');
 });
 
 // Start the server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(process.env.PORT || 3000, () => {
+    console.log(`Server is running on port ${process.env.PORT || 3000}`);
 });
