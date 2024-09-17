@@ -264,11 +264,11 @@ const galleryTemplate = (media) => `
             bottom: 0;
             left: 0;
             right: 0;
-            background: rgba(0, 0, 0, 0.6);
-            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
             padding: 10px;
-            font-size: 14px;
             display: none;
+            text-align: center;
         }
         .gallery-item:hover .info {
             display: block;
