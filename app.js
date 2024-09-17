@@ -3,6 +3,7 @@ const multer = require('multer');
 const SFTPClient = require('ssh2-sftp-client');
 const path = require('path');
 const fs = require('fs');
+const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
 const mime = require('mime-types'); // For detecting MIME types
 const app = express();
@@ -17,36 +18,38 @@ const SFTP_USER = process.env.SFTP_USER;
 const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
 const SFTP_DIR = process.env.SFTP_DIR || '/';
 
-// Allowed IP address for uploading videos and creating folders
-const ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
+// Allowed IP address for uploading videos
+const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
 
 // Local video storage directory
-const LOCAL_MEDIA_DIR = 'local_media/';
+const LOCAL_VIDEO_DIR = 'local_videos/';
 
 // Upload limit from environment variable (default to 700 MB)
 const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
 
 // Configure multer to store files in a specific directory
 const upload = multer({
-    dest: LOCAL_MEDIA_DIR, // Directory to store uploaded files
+    dest: LOCAL_VIDEO_DIR, // Directory to store uploaded files
     limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } // Limit file size to configured limit
 });
 
-// Ensure local media directory exists
-if (!fs.existsSync(LOCAL_MEDIA_DIR)) {
-    fs.mkdirSync(LOCAL_MEDIA_DIR);
+// Ensure local video directory exists
+if (!fs.existsSync(LOCAL_VIDEO_DIR)){
+    fs.mkdirSync(LOCAL_VIDEO_DIR);
 }
 
 // Trust the X-Forwarded-For header to get the correct client IP if using a proxy
 app.set('trust proxy', true);
 
-// Middleware to check IP address for uploads and folder creation
+// Middleware to check IP address for uploads
 function ipRestrict(req, res, next) {
     const clientIp = req.ip;
-    if (clientIp === ALLOWED_IP) {
+    console.log(`Client IP: ${clientIp}`);
+    
+    if (clientIp === UPLOAD_ALLOWED_IP) {
         next();
     } else {
-        res.status(403).send('Forbidden: You are not allowed to perform this action.');
+        res.status(403).send('Forbidden: You are not allowed to upload.');
     }
 }
 
@@ -90,13 +93,13 @@ async function listMedia() {
         }
 
         // List files from local directory
-        const localFileList = fs.readdirSync(LOCAL_MEDIA_DIR);
+        const localFileList = fs.readdirSync(LOCAL_VIDEO_DIR);
 
         for (const file of localFileList) {
             const ext = path.extname(file).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/local/${encodeURIComponent(file)}`;
-                const filePath = path.join(LOCAL_MEDIA_DIR, file);
+                const filePath = path.join(LOCAL_VIDEO_DIR, file);
                 const fileStat = fs.statSync(filePath);
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
@@ -124,58 +127,196 @@ async function listMedia() {
     }
 }
 
-// Serve static files for local media
-app.use('/local', express.static(LOCAL_MEDIA_DIR));
+// Serve static files
+app.use(express.static('public'));
+app.use('/local', express.static(LOCAL_VIDEO_DIR));
+app.use(express.urlencoded({ extended: true }));
 
-// Route to display the gallery
+// Define the HTML template for the gallery
+function galleryTemplate(media) {
+    return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Media Gallery</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f0f0f0;
+                color: #333;
+                margin: 0;
+                padding: 0;
+            }
+            h1 {
+                text-align: center;
+                padding: 20px;
+            }
+            .gallery {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                justify-content: center;
+                padding: 20px;
+            }
+            .gallery-item {
+                position: relative;
+                background-color: #fff;
+                border-radius: 8px;
+                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+                max-width: 300px;
+                margin: 10px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                cursor: pointer;
+            }
+            .gallery-item img {
+                display: block;
+                width: 100%;
+                height: auto;
+                object-fit: cover;
+            }
+            .gallery-item video {
+                display: block;
+                width: 100%;
+                height: auto;
+                object-fit: cover;
+            }
+            .info {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                background: rgba(0, 0, 0, 0.6);
+                color: white;
+                padding: 10px;
+                font-size: 14px;
+                display: none;
+                text-align: center;
+            }
+            .gallery-item:hover .info {
+                display: block;
+            }
+            .download-button {
+                display: block;
+                margin: 10px;
+                padding: 10px;
+                background: #007bff;
+                color: white;
+                text-align: center;
+                text-decoration: none;
+                border-radius: 5px;
+                width: calc(100% - 20px);
+                font-size: 14px;
+                box-sizing: border-box;
+            }
+            .download-button:hover {
+                background: #0056b3;
+            }
+            .fullscreen {
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.9);
+                z-index: 1000;
+                justify-content: center;
+                align-items: center;
+            }
+            .fullscreen img, .fullscreen video {
+                max-width: 90%;
+                max-height: 90%;
+            }
+            .fullscreen .close {
+                position: absolute;
+                top: 20px;
+                right: 20px;
+                font-size: 24px;
+                color: white;
+                cursor: pointer;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Media Gallery</h1>
+        <div class="gallery">
+            ${media.map(item => `
+                <div class="gallery-item" onclick="openFullscreen('${item.url}')">
+                    ${item.url.endsWith('.mp4') ? `<video src="${item.url}" controls></video>` : `<img src="${item.url}" alt="Media">`}
+                    <div class="info">
+                        <p>Size: ${(item.size / 1024 / 1024).toFixed(2)} MB</p>
+                        <p>Date: ${item.uploadDate}</p>
+                    </div>
+                    <a href="${item.url}" class="download-button" download>Download</a>
+                </div>
+            `).join('')}
+        </div>
+
+        <div id="fullscreen" class="fullscreen" onclick="closeFullscreen()">
+            <span class="close" onclick="closeFullscreen()">×</span>
+            <img id="fullscreen-image" src="" style="display:none;">
+            <video id="fullscreen-video" src="" controls style="display:none;"></video>
+        </div>
+
+        <form action="/create-folder" method="post">
+            <input type="text" name="folderName" placeholder="New folder name" required>
+            <button type="submit">Create Folder</button>
+        </form>
+
+        <script>
+            function openFullscreen(url) {
+                const imgElement = document.getElementById('fullscreen-image');
+                const videoElement = document.getElementById('fullscreen-video');
+                if (url.endsWith('.mp4')) {
+                    videoElement.src = url;
+                    videoElement.style.display = 'block';
+                    imgElement.style.display = 'none';
+                } else {
+                    imgElement.src = url;
+                    imgElement.style.display = 'block';
+                    videoElement.style.display = 'none';
+                }
+                document.getElementById('fullscreen').style.display = 'flex';
+            }
+
+            function closeFullscreen() {
+                document.getElementById('fullscreen').style.display = 'none';
+                document.getElementById('fullscreen-image').src = '';
+                document.getElementById('fullscreen-video').src = '';
+            }
+        </script>
+    </body>
+    </html>
+    `;
+}
+
+// Serve gallery
 app.get('/', async (req, res) => {
     const media = await listMedia();
-    const galleryHtml = galleryTemplate(media);
-    res.send(galleryHtml);
+    res.send(galleryTemplate(media));
 });
 
-// Route to handle video uploads
-app.post('/upload', ipRestrict, upload.single('video'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
-    res.send('File uploaded successfully.');
-});
+// Serve files from local directory
+app.use('/local', express.static(LOCAL_VIDEO_DIR));
 
-// Route to handle folder creation
-app.post('/create-folder', ipRestrict, express.urlencoded({ extended: true }), (req, res) => {
-    const { folderName } = req.body;
-    if (!folderName) {
-        return res.status(400).send('Folder name is required.');
-    }
-
-    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
-
-    // Check if folder already exists
-    if (fs.existsSync(folderPath)) {
-        return res.status(400).send('Folder already exists.');
-    }
-
-    // Create the new folder
-    fs.mkdir(folderPath, (err) => {
-        if (err) {
-            console.error(err);
-            return res.status(500).send('Error creating folder.');
-        }
-
-        res.send('Folder created successfully.');
-    });
-});
-
-// Serve static files for SFTP media
+// Serve media files from SFTP
 app.get('/media/:filename', async (req, res) => {
     const { filename } = req.params;
     let sftp;
     try {
         sftp = await createSFTPConnection();
         const fileStream = await sftp.get(path.join(SFTP_DIR, filename));
-        res.setHeader('Content-Type', mime.lookup(filename) || 'application/octet-stream');
-        fileStream.pipe(res);
+        if (fileStream instanceof PassThrough) {
+            res.setHeader('Content-Type', mime.lookup(filename) || 'application/octet-stream');
+            fileStream.pipe(res);
+        } else {
+            res.status(500).send('Failed to get file stream.');
+        }
     } catch (error) {
         console.error(error);
         res.status(404).send('File not found.');
@@ -186,165 +327,26 @@ app.get('/media/:filename', async (req, res) => {
     }
 });
 
+// Handle file uploads
+app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
+    res.send('File uploaded successfully');
+});
+
+// Handle folder creation
+app.post('/create-folder', ipRestrict, (req, res) => {
+    const { folderName } = req.body;
+    const newFolderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+
+    if (fs.existsSync(newFolderPath)) {
+        res.status(400).send('Folder already exists.');
+    } else {
+        fs.mkdirSync(newFolderPath);
+        res.redirect('/');
+    }
+});
+
 // Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server is running on port ${PORT}`);
 });
-
-// Define the HTML template for the gallery
-function galleryTemplate(media) {
-    return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Media Gallery</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            color: #333;
-            margin: 0;
-            padding: 0;
-        }
-        h1 {
-            text-align: center;
-            padding: 20px;
-        }
-        .gallery {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            justify-content: center;
-            padding: 20px;
-        }
-        .gallery-item {
-            position: relative;
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-            max-width: 300px;
-            margin: 10px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            cursor: pointer;
-        }
-        .gallery-item img, .gallery-item video {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .info {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0, 0, 0, 0.6);
-            color: white;
-            padding: 10px;
-            font-size: 14px;
-            display: none;
-            text-align: center;
-        }
-        .gallery-item:hover .info {
-            display: block;
-        }
-        .download-button {
-            display: block;
-            margin: 10px;
-            padding: 10px;
-            background: #007bff;
-            color: white;
-            text-align: center;
-            text-decoration: none;
-            border-radius: 5px;
-            width: calc(100% - 20px);
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        .download-button:hover {
-            background: #0056b3;
-        }
-        .fullscreen {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-        .fullscreen img, .fullscreen video {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen .close {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            font-size: 24px;
-            color: white;
-            cursor: pointer;
-        }
-    </style>
-</head>
-<body>
-    <h1>Media Gallery</h1>
-    <div class="gallery">
-        ${media.map(item => `
-            <div class="gallery-item" onclick="openFullscreen('${item.url}')">
-                ${item.url.endsWith('.mp4') ? `<video src="${item.url}" controls></video>` : `<img src="${item.url}" alt="Media">`}
-                <div class="info">
-                    <p>Size: ${(item.size / 1024 / 1024).toFixed(2)} MB</p>
-                    <p>Date: ${item.uploadDate}</p>
-                </div>
-                <a href="${item.url}" class="download-button" download>Download</a>
-            </div>
-        `).join('')}
-    </div>
-
-    <div id="fullscreen" class="fullscreen" onclick="closeFullscreen()">
-        <span class="close" onclick="closeFullscreen()">×</span>
-        <img id="fullscreen-image" src="" style="display:none;">
-        <video id="fullscreen-video" src="" controls style="display:none;"></video>
-    </div>
-
-    <form action="/create-folder" method="post">
-        <input type="text" name="folderName" placeholder="New folder name" required>
-        <button type="submit">Create Folder</button>
-    </form>
-
-    <script>
-        function openFullscreen(url) {
-            const imgElement = document.getElementById('fullscreen-image');
-            const videoElement = document.getElementById('fullscreen-video');
-            if (url.endsWith('.mp4')) {
-                videoElement.src = url;
-                videoElement.style.display = 'block';
-                imgElement.style.display = 'none';
-            } else {
-                imgElement.src = url;
-                imgElement.style.display = 'block';
-                videoElement.style.display = 'none';
-            }
-            document.getElementById('fullscreen').style.display = 'flex';
-        }
-
-        function closeFullscreen() {
-            document.getElementById('fullscreen').style.display = 'none';
-            document.getElementById('fullscreen-image').src = '';
-            document.getElementById('fullscreen-video').src = '';
-        }
-    </script>
-</body>
-</html>
-    `;
-}
