@@ -106,7 +106,6 @@ async function listMediaFromSFTP() {
 
 // Serve static files
 app.use(express.static('public'));
-app.use('/local', express.static(LOCAL_VIDEO_DIR));
 app.use(express.urlencoded({ extended: true }));
 
 // Define the HTML template for the gallery
