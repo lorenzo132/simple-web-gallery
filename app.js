@@ -6,44 +6,52 @@ const fs = require('fs');
 const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
 const mime = require('mime-types'); // For detecting MIME types
-const { createClient } = require('webdav'); // Correct import for webdav
 const app = express();
 
 // Load environment variables from .env file
 dotenv.config();
 
-// Configuration from environment variables
-const PORT = process.env.PORT || 3000;
-const LOCAL_MEDIA_DIR = process.env.LOCAL_MEDIA_DIR;
-const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL;
-const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER;
-const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD;
-const NEXTCLOUD_DIR = process.env.NEXTCLOUD_DIR;
+// SFTP configuration from environment variables
 const SFTP_HOST = process.env.SFTP_HOST;
 const SFTP_PORT = process.env.SFTP_PORT || 22;
 const SFTP_USER = process.env.SFTP_USER;
 const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
 const SFTP_DIR = process.env.SFTP_DIR || '/';
-const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
-const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
 
-// Ensure local media directory exists
-if (!fs.existsSync(LOCAL_MEDIA_DIR)) {
-    fs.mkdirSync(LOCAL_MEDIA_DIR, { recursive: true });
-}
+// Nextcloud configuration from environment variables
+const NEXTCLOUD_URL = process.env.NEXTCLOUD_URL;
+const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER;
+const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD;
+
+// Allowed IP address for uploading and folder creation
+const ALLOWED_IP = process.env.ALLOWED_IP;
+
+// Local media storage directory
+const LOCAL_MEDIA_DIR = 'local_media/';
+
+// Upload limit from environment variable (default to 700 MB)
+const UPLOAD_LIMIT_MB = parseInt(process.env.UPLOAD_LIMIT_MB, 10) || 700;
 
 // Configure multer to store files in a specific directory
 const upload = multer({
-    dest: LOCAL_MEDIA_DIR,
-    limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 }
+    dest: LOCAL_MEDIA_DIR, // Directory to store uploaded files
+    limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } // Limit file size to configured limit
 });
+
+// Ensure local media directory exists
+if (!fs.existsSync(LOCAL_MEDIA_DIR)){
+    fs.mkdirSync(LOCAL_MEDIA_DIR);
+}
+
+// Trust the X-Forwarded-For header to get the correct client IP if using a proxy
+app.set('trust proxy', true);
 
 // Middleware to check IP address for uploads and folder creation
 function ipRestrict(req, res, next) {
     const clientIp = req.ip;
     console.log(`Client IP: ${clientIp}`);
     
-    if (clientIp === UPLOAD_ALLOWED_IP) {
+    if (clientIp === ALLOWED_IP) {
         next();
     } else {
         res.status(403).send('Forbidden: You are not allowed to perform this action.');
@@ -62,11 +70,10 @@ async function createSFTPConnection() {
     return sftp;
 }
 
-// Function to list media files from SFTP, local directory, and Nextcloud
+// Function to list media files from local directory and SFTP
 async function listMedia() {
     let sftp;
     const mediaItems = [];
-
     try {
         // List files from SFTP
         sftp = await createSFTPConnection();
@@ -112,32 +119,6 @@ async function listMedia() {
             }
         }
 
-        // List files from Nextcloud
-        const client = createClient(NEXTCLOUD_URL, {
-            username: NEXTCLOUD_USER,
-            password: NEXTCLOUD_PASSWORD
-        });
-
-        const nextcloudFileList = await client.getDirectoryContents(NEXTCLOUD_DIR);
-
-        for (const file of nextcloudFileList) {
-            const ext = path.extname(file.name).toLowerCase();
-            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
-                const fileUrl = `/nextcloud/${encodeURIComponent(file.name)}`;
-                const fileStat = await client.getStats(path.join(NEXTCLOUD_DIR, file.name));
-                let uploadDate = new Date(fileStat.mtime);
-                if (isNaN(uploadDate)) {
-                    uploadDate = 'Unknown Date';
-                }
-
-                mediaItems.push({
-                    url: fileUrl,
-                    size: fileStat.size,
-                    uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
-                });
-            }
-        }
-
         mediaItems.sort((a, b) => (a.uploadDate instanceof Date && b.uploadDate instanceof Date) ? b.uploadDate - a.uploadDate : 0);
 
         return mediaItems;
@@ -151,12 +132,86 @@ async function listMedia() {
     }
 }
 
-// Serve static files
-app.use(express.static('public'));
+// Dynamically import the webdav package
+let webdav;
+async function getWebDAVClient() {
+    if (!webdav) {
+        const { createClient } = await import('webdav');
+        webdav = createClient(NEXTCLOUD_URL, {
+            username: NEXTCLOUD_USER,
+            password: NEXTCLOUD_PASSWORD
+        });
+    }
+    return webdav;
+}
+
+// Route to serve media from local storage
 app.use('/local', express.static(LOCAL_MEDIA_DIR));
-app.use('/nextcloud', express.static(NEXTCLOUD_DIR));
-app.use('/media', express.static(path.join(LOCAL_MEDIA_DIR, 'media'))); // Serve media files from SFTP
-app.use(express.urlencoded({ extended: true }));
+
+// Route to serve media from SFTP
+app.get('/media/:filename', async (req, res) => {
+    const { filename } = req.params;
+    let sftp;
+    try {
+        sftp = await createSFTPConnection();
+        const remoteFilePath = path.join(SFTP_DIR, filename);
+        const sftpStream = await sftp.get(remoteFilePath);
+
+        if (Buffer.isBuffer(sftpStream)) {
+            const stream = new PassThrough();
+            stream.end(sftpStream);
+
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+            stream.pipe(res);
+        } else {
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+            sftpStream.pipe(res);
+        }
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error retrieving file.');
+    } finally {
+        if (sftp) {
+            await sftp.end();
+        }
+    }
+});
+
+// Route to serve media from Nextcloud
+app.get('/nextcloud/:filename', async (req, res) => {
+    const { filename } = req.params;
+    try {
+        const client = await getWebDAVClient();
+        const stream = await client.createReadStream(filename);
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+        stream.pipe(res);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error retrieving file from Nextcloud.');
+    }
+});
+
+// Route to create a new folder (only allowed IP)
+app.post('/create-folder', ipRestrict, express.urlencoded({ extended: true }), (req, res) => {
+    const folderName = req.body.folderName;
+    if (!folderName) {
+        return res.status(400).send('Folder name is required.');
+    }
+
+    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
+    if (fs.existsSync(folderPath)) {
+        return res.status(400).send('Folder already exists.');
+    }
+
+    fs.mkdirSync(folderPath, { recursive: true });
+    res.send('Folder created successfully.');
+});
 
 // Define the HTML template for the gallery
 const galleryTemplate = (media) => `
@@ -198,13 +253,7 @@ const galleryTemplate = (media) => `
             align-items: center;
             cursor: pointer;
         }
-        .gallery-item img {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .gallery-item video {
+        .gallery-item img, .gallery-item video {
             display: block;
             width: 100%;
             height: auto;
@@ -220,148 +269,56 @@ const galleryTemplate = (media) => `
             padding: 10px;
             font-size: 14px;
             display: none;
-            text-align: center;
         }
         .gallery-item:hover .info {
             display: block;
-        }
-        .download-button {
-            display: block;
-            margin: 10px;
-            padding: 10px;
-            background: #007bff;
-            color: white;
-            text-align: center;
-            text-decoration: none;
-            border-radius: 5px;
-            width: calc(100% - 20px);
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        .download-button:hover {
-            background: #0056b3;
-        }
-        .fullscreen {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-        .fullscreen img {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen video {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen-close {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            font-size: 24px;
-            color: white;
-            cursor: pointer;
         }
     </style>
 </head>
 <body>
     <h1>Media Gallery</h1>
     <div class="gallery">
-        ${media.map(({ url, size, uploadDate }) => {
-            const dateStr = uploadDate instanceof Date ? uploadDate.toISOString().split('T')[0] : uploadDate;
-            const isVideo = url.endsWith('.mp4') || url.endsWith('.avi') || url.endsWith('.mov');
-            const type = isVideo ? 'video' : 'img';
-            return `
-                <div class="gallery-item">
-                    <${type} src="${url}" controls="controls" style="max-height: 200px;"></${type}>
-                    <div class="info">
-                        <div>Size: ${(size / (1024 * 1024)).toFixed(2)} MB</div>
-                        <div>Upload Date: ${dateStr}</div>
-                        <a class="download-button" href="${url}" download>Download</a>
-                    </div>
-                </div>
-            `;
-        }).join('')}
-    </div>
-    <div id="fullscreen" class="fullscreen">
-        <div class="fullscreen-close" onclick="window.location='#'">✖</div>
-        <img id="fullscreen-img" src="" alt="">
-        <video id="fullscreen-video" controls="controls" style="display:none;"></video>
-    </div>
-    <script>
-        document.querySelectorAll('.gallery-item').forEach(item => {
-            item.addEventListener('click', () => {
-                const isVideo = item.querySelector('video');
-                if (isVideo) {
-                    document.getElementById('fullscreen-video').src = isVideo.src;
-                    document.getElementById('fullscreen-img').style.display = 'none';
-                    document.getElementById('fullscreen-video').style.display = 'block';
-                } else {
-                    document.getElementById('fullscreen-img').src = item.querySelector('img').src;
-                    document.getElementById('fullscreen-video').style.display = 'none';
-                    document.getElementById('fullscreen-img').style.display = 'block';
+        ${media.map(item => `
+            <div class="gallery-item">
+                ${item.url.endsWith('.mp4') ? 
+                    `<video controls>
+                        <source src="${item.url}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>` : 
+                    `<img src="${item.url}" alt="${item.url}">`
                 }
-                window.location = '#fullscreen';
-            });
-        });
-    </script>
+                <div class="info">
+                    <p>Size: ${(item.size / 1024 / 1024).toFixed(2)} MB</p>
+                    <p>Upload Date: ${item.uploadDate}</p>
+                </div>
+            </div>`
+        ).join('')}
+    </div>
 </body>
 </html>
 `;
 
-// Route to serve gallery
+// Route to display the media gallery
 app.get('/gallery', async (req, res) => {
-    const mediaItems = await listMedia();
-    res.send(galleryTemplate(mediaItems));
+    try {
+        const mediaItems = await listMedia();
+        res.send(galleryTemplate(mediaItems));
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error displaying media gallery.');
+    }
 });
 
 // Route to handle file uploads
-app.post('/upload', ipRestrict, upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).send('No file uploaded.');
-        }
-
-        // Save to local directory
-        const localFilePath = path.join(LOCAL_MEDIA_DIR, req.file.originalname);
-        fs.renameSync(req.file.path, localFilePath);
-
-        // Optionally, upload to SFTP
-        const sftp = await createSFTPConnection();
-        await sftp.put(localFilePath, path.join(SFTP_DIR, req.file.originalname));
-        await sftp.end();
-
-        res.send('File uploaded successfully.');
-    } catch (error) {
-        console.error(error);
-        res.status(500).send('Internal Server Error.');
-    }
+app.post('/upload', upload.single('file'), (req, res) => {
+    res.send('File uploaded successfully.');
 });
 
-// Route to create a new folder (only allowed IP)
-app.post('/create-folder', ipRestrict, express.urlencoded({ extended: true }), (req, res) => {
-    const folderName = req.body.folderName;
-    if (!folderName) {
-        return res.status(400).send('Folder name is required.');
-    }
-
-    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
-    if (fs.existsSync(folderPath)) {
-        return res.status(400).send('Folder already exists.');
-    }
-
-    fs.mkdirSync(folderPath, { recursive: true });
-    res.send('Folder created successfully.');
-});
+// Serve static files for the local media directory
+app.use('/local', express.static(LOCAL_MEDIA_DIR));
 
 // Start the server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
