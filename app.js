@@ -6,6 +6,7 @@ const fs = require('fs');
 const { PassThrough } = require('stream');
 const dotenv = require('dotenv');
 const mime = require('mime-types'); // For detecting MIME types
+const { Client } = require('nextcloud-node-client'); // For Nextcloud integration
 const app = express();
 
 // Load environment variables from .env file
@@ -18,7 +19,13 @@ const SFTP_USER = process.env.SFTP_USER;
 const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
 const SFTP_DIR = process.env.SFTP_DIR || '/';
 
-// Allowed IP address for uploading videos
+// Nextcloud configuration from environment variables
+const NEXTCLOUD_HOST = process.env.NEXTCLOUD_HOST;
+const NEXTCLOUD_USER = process.env.NEXTCLOUD_USER;
+const NEXTCLOUD_PASSWORD = process.env.NEXTCLOUD_PASSWORD;
+const NEXTCLOUD_DIR = process.env.NEXTCLOUD_DIR || '/';
+
+// Allowed IP address for uploading and managing folders
 const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
 
 // Local video storage directory
@@ -41,7 +48,7 @@ if (!fs.existsSync(LOCAL_VIDEO_DIR)){
 // Trust the X-Forwarded-For header to get the correct client IP if using a proxy
 app.set('trust proxy', true);
 
-// Middleware to check IP address for uploads
+// Middleware to check IP address for uploads and folder management
 function ipRestrict(req, res, next) {
     const clientIp = req.ip;
     console.log(`Client IP: ${clientIp}`);
@@ -49,7 +56,7 @@ function ipRestrict(req, res, next) {
     if (clientIp === UPLOAD_ALLOWED_IP) {
         next();
     } else {
-        res.status(403).send('Forbidden: You are not allowed to upload.');
+        res.status(403).send('Forbidden: You are not allowed to manage folders.');
     }
 }
 
@@ -65,20 +72,30 @@ async function createSFTPConnection() {
     return sftp;
 }
 
-// Function to list media files from both SFTP and local directories
-async function listMedia() {
-    let sftp;
+// Function to create a Nextcloud client connection
+function createNextcloudClient() {
+    const client = new Client({
+        url: NEXTCLOUD_HOST,
+        username: NEXTCLOUD_USER,
+        password: NEXTCLOUD_PASSWORD,
+    });
+    return client;
+}
+
+// Function to list media files from SFTP, local, and Nextcloud directories
+async function listMedia(folder = '') {
+    let sftp, nextcloudClient;
     const mediaItems = [];
     try {
         // List files from SFTP
         sftp = await createSFTPConnection();
-        const sftpFileList = await sftp.list(SFTP_DIR);
+        const sftpFileList = await sftp.list(path.join(SFTP_DIR, folder));
 
         for (const file of sftpFileList) {
             const ext = path.extname(file.name).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/media/${encodeURIComponent(file.name)}`;
-                const fileStat = await sftp.stat(path.join(SFTP_DIR, file.name));
+                const fileStat = await sftp.stat(path.join(SFTP_DIR, folder, file.name));
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
                     uploadDate = 'Unknown Date';
@@ -93,13 +110,13 @@ async function listMedia() {
         }
 
         // List files from local directory
-        const localFileList = fs.readdirSync(LOCAL_VIDEO_DIR);
+        const localFileList = fs.readdirSync(path.join(LOCAL_VIDEO_DIR, folder));
 
         for (const file of localFileList) {
             const ext = path.extname(file).toLowerCase();
             if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
                 const fileUrl = `/local/${encodeURIComponent(file)}`;
-                const filePath = path.join(LOCAL_VIDEO_DIR, file);
+                const filePath = path.join(LOCAL_VIDEO_DIR, folder, file);
                 const fileStat = fs.statSync(filePath);
                 let uploadDate = new Date(fileStat.mtime);
                 if (isNaN(uploadDate)) {
@@ -110,6 +127,22 @@ async function listMedia() {
                     url: fileUrl,
                     size: fileStat.size,
                     uploadDate: uploadDate instanceof Date ? uploadDate : 'Unknown Date'
+                });
+            }
+        }
+
+        // List files from Nextcloud
+        nextcloudClient = createNextcloudClient();
+        const nextcloudFileList = await nextcloudClient.getFolderContents(NEXTCLOUD_DIR + folder);
+
+        for (const file of nextcloudFileList) {
+            const ext = path.extname(file.name).toLowerCase();
+            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.avi', '.mov'].includes(ext)) {
+                const fileUrl = `/nextcloud/${encodeURIComponent(file.name)}`;
+                mediaItems.push({
+                    url: fileUrl,
+                    size: file.size,
+                    uploadDate: file.lastModifiedDate || 'Unknown Date'
                 });
             }
         }
@@ -132,162 +165,38 @@ app.use(express.static('public'));
 app.use('/local', express.static(LOCAL_VIDEO_DIR));
 app.use(express.urlencoded({ extended: true }));
 
-// Define the HTML template for the gallery
-const galleryTemplate = (media) => `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Media Gallery</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            color: #333;
-            margin: 0;
-            padding: 0;
-        }
-        h1 {
-            text-align: center;
-            padding: 20px;
-        }
-        .gallery {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            justify-content: center;
-            padding: 20px;
-        }
-        .gallery-item {
-            position: relative;
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-            max-width: 300px;
-            margin: 10px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            cursor: pointer;
-        }
-        .gallery-item img {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .gallery-item video {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .info {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0, 0, 0, 0.6);
-            color: white;
-            padding: 10px;
-            font-size: 14px;
-            display: none;
-            text-align: center;
-        }
-        .gallery-item:hover .info {
-            display: block;
-        }
-        .download-button {
-            display: block;
-            margin: 10px;
-            padding: 10px;
-            background: #007bff;
-            color: white;
-            text-align: center;
-            text-decoration: none;
-            border-radius: 5px;
-            width: calc(100% - 20px);
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        .download-button:hover {
-            background: #0056b3;
-        }
-        .fullscreen {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-        .fullscreen img {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen video {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen:target {
-            display: flex;
-        }
-        .fullscreen-close {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            color: white;
-            font-size: 24px;
-            cursor: pointer;
-        }
-    </style>
-</head>
-<body>
-    <h1>Media Gallery</h1>
-    <div class="gallery">
-        ${media.map(({ url, size, uploadDate }) => {
-            const dateStr = uploadDate instanceof Date ? uploadDate.toDateString() : 'Unknown Date';
-            const isVideo = url.endsWith('.mp4') || url.endsWith('.avi') || url.endsWith('.mov');
-            const fileName = path.basename(url);
-            return `
-            <div class="gallery-item" onclick="openFullscreen('${fileName}')">
-                ${isVideo ? 
-                    `<video src="${url}" controls></video>` : 
-                    `<img src="${url}" alt="Image" />`
-                }
-                <div class="info">Size: ${size} bytes<br>Uploaded: ${dateStr}</div>
-                <a href="${url}" download class="download-button">Download</a>
-            </div>
-            <div id="fullscreen-${fileName}" class="fullscreen">
-                <span class="fullscreen-close" onclick="closeFullscreen()">×</span>
-                ${isVideo ? 
-                    `<video src="${url}" controls autoplay></video>` : 
-                    `<img src="${url}" alt="Image" />`
-                }
-            </div>
-            `;
-        }).join('')}
-    </div>
-    <script>
-        function openFullscreen(fileName) {
-            document.getElementById('fullscreen-' + fileName).style.display = 'flex';
-        }
+// Template for gallery page with folder management buttons
+function galleryTemplate(media, showFolderButtons) {
+    let html = `
+        <h1>Media Gallery</h1>
+        <div>
+            ${media.map(item => `
+                <div>
+                    <a href="${item.url}">${item.url.split('/').pop()}</a>
+                    <p>Size: ${item.size} bytes, Uploaded: ${item.uploadDate}</p>
+                </div>
+            `).join('')}
+        </div>
+    `;
 
-        function closeFullscreen() {
-            document.querySelectorAll('.fullscreen').forEach(element => {
-                element.style.display = 'none';
-            });
-        }
-    </script>
-</body>
-</html>
-`;
+    if (showFolderButtons) {
+        html += `
+            <h2>Manage Folders</h2>
+            <form action="/create-folder" method="POST">
+                <label for="folderName">New Folder Name:</label>
+                <input type="text" id="folderName" name="folderName" required>
+                <button type="submit">Create Folder</button>
+            </form>
+            <form action="/delete-folder" method="POST">
+                <label for="folderName">Delete Folder Name:</label>
+                <input type="text" id="folderName" name="folderName" required>
+                <button type="submit">Delete Folder</button>
+            </form>
+        `;
+    }
+
+    return html;
+}
 
 // Route to handle local video streaming with range requests
 app.get('/local/:filename', (req, res) => {
@@ -327,80 +236,66 @@ app.get('/local/:filename', (req, res) => {
     });
 });
 
-// Route to stream media files from SFTP
-app.get('/media/:filename', async (req, res) => {
-    const { filename } = req.params;
-    let sftp;
-    try {
-        sftp = await createSFTPConnection();
-        const remoteFilePath = path.join(SFTP_DIR, filename);
-        const sftpStream = await sftp.get(remoteFilePath);
-
-        if (Buffer.isBuffer(sftpStream)) {
-            const stream = new PassThrough();
-            stream.end(sftpStream);
-
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-            stream.pipe(res);
-        } else {
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-            sftpStream.pipe(res);
-        }
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).send('Error retrieving file.');
-    } finally {
-        if (sftp) {
-            await sftp.end();
-        }
-    }
-});
-
-// Define the route to display the gallery
+// Route to list folders and media, showing folder management buttons only for allowed IPs
 app.get('/', async (req, res) => {
+    const clientIp = req.ip;
+    const showFolderButtons = clientIp === UPLOAD_ALLOWED_IP;
     const media = await listMedia();
-    res.send(galleryTemplate(media));
+    res.send(galleryTemplate(media, showFolderButtons));
 });
 
-// Define the route for the upload page
-app.get('/upload', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Upload Video</title>
-    </head>
-    <body>
-        <h1>Upload Video</h1>
-        <form action="/upload" method="post" enctype="multipart/form-data">
-            <input type="file" name="video" accept="video/*" required>
-            <button type="submit">Upload</button>
-        </form>
-    </body>
-    </html>
-    `);
-});
+// Route to create new folders
+app.post('/create-folder', ipRestrict, (req, res) => {
+    const folderName = req.body.folderName;
 
-// Define the route to handle video uploads
-app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
+    // Create folder locally
+    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    if (!fs.existsSync(folderPath)) {
+        fs.mkdirSync(folderPath);
     }
-    
-    // Detect the file type and rename it with the correct extension
-    const filePath = path.join(LOCAL_VIDEO_DIR, req.file.filename);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = mime.lookup(req.file.originalname) || 'video/mp4'; // Default to mp4 if type cannot be detected
-    const newFilePath = path.join(LOCAL_VIDEO_DIR, `${req.file.filename}${mime.extension(mimeType) ? '.' + mime.extension(mimeType) : '.mp4'}`);
 
-    fs.renameSync(filePath, newFilePath);
+    // Create folder in SFTP and Nextcloud if applicable
+    (async () => {
+        try {
+            const sftp = await createSFTPConnection();
+            await sftp.mkdir(path.join(SFTP_DIR, folderName));
+            sftp.end();
 
-    res.send('Upload successful.');
+            const nextcloudClient = createNextcloudClient();
+            await nextcloudClient.createFolder(NEXTCLOUD_DIR + folderName);
+        } catch (error) {
+            console.error(error);
+        }
+    })();
+
+    res.redirect('/');
+});
+
+// Route to delete folders
+app.post('/delete-folder', ipRestrict, (req, res) => {
+    const folderName = req.body.folderName;
+
+    // Delete folder locally
+    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    if (fs.existsSync(folderPath)) {
+        fs.rmdirSync(folderPath, { recursive: true });
+    }
+
+    // Delete folder in SFTP and Nextcloud if applicable
+    (async () => {
+        try {
+            const sftp = await createSFTPConnection();
+            await sftp.rmdir(path.join(SFTP_DIR, folderName), true);
+            sftp.end();
+
+            const nextcloudClient = createNextcloudClient();
+            await nextcloudClient.deleteFolder(NEXTCLOUD_DIR + folderName);
+        } catch (error) {
+            console.error(error);
+        }
+    })();
+
+    res.redirect('/');
 });
 
 // Start the server
