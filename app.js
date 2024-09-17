@@ -124,13 +124,77 @@ async function listMedia() {
     }
 }
 
-// Serve static files
-app.use(express.static('public'));
+// Serve static files for local media
 app.use('/local', express.static(LOCAL_MEDIA_DIR));
-app.use(express.urlencoded({ extended: true }));
+
+// Route to display the gallery
+app.get('/', async (req, res) => {
+    const media = await listMedia();
+    const galleryHtml = galleryTemplate(media);
+    res.send(galleryHtml);
+});
+
+// Route to handle video uploads
+app.post('/upload', ipRestrict, upload.single('video'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).send('No file uploaded.');
+    }
+    res.send('File uploaded successfully.');
+});
+
+// Route to handle folder creation
+app.post('/create-folder', ipRestrict, express.urlencoded({ extended: true }), (req, res) => {
+    const { folderName } = req.body;
+    if (!folderName) {
+        return res.status(400).send('Folder name is required.');
+    }
+
+    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
+
+    // Check if folder already exists
+    if (fs.existsSync(folderPath)) {
+        return res.status(400).send('Folder already exists.');
+    }
+
+    // Create the new folder
+    fs.mkdir(folderPath, (err) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).send('Error creating folder.');
+        }
+
+        res.send('Folder created successfully.');
+    });
+});
+
+// Serve static files for SFTP media
+app.get('/media/:filename', async (req, res) => {
+    const { filename } = req.params;
+    let sftp;
+    try {
+        sftp = await createSFTPConnection();
+        const fileStream = await sftp.get(path.join(SFTP_DIR, filename));
+        res.setHeader('Content-Type', mime.lookup(filename) || 'application/octet-stream');
+        fileStream.pipe(res);
+    } catch (error) {
+        console.error(error);
+        res.status(404).send('File not found.');
+    } finally {
+        if (sftp) {
+            await sftp.end();
+        }
+    }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
 
 // Define the HTML template for the gallery
-const galleryTemplate = (media) => `
+function galleryTemplate(media) {
+    return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -222,108 +286,64 @@ const galleryTemplate = (media) => `
             max-width: 90%;
             max-height: 90%;
         }
-        .fullscreen:target {
-            display: flex;
-        }
-        .fullscreen-close {
+        .fullscreen .close {
             position: absolute;
             top: 20px;
             right: 20px;
-            color: white;
             font-size: 24px;
+            color: white;
             cursor: pointer;
         }
     </style>
 </head>
 <body>
     <h1>Media Gallery</h1>
-    <form action="/create-folder" method="post" id="create-folder-form">
-        <input type="text" name="folderName" placeholder="New Folder Name" required>
+    <div class="gallery">
+        ${media.map(item => `
+            <div class="gallery-item" onclick="openFullscreen('${item.url}')">
+                ${item.url.endsWith('.mp4') ? `<video src="${item.url}" controls></video>` : `<img src="${item.url}" alt="Media">`}
+                <div class="info">
+                    <p>Size: ${(item.size / 1024 / 1024).toFixed(2)} MB</p>
+                    <p>Date: ${item.uploadDate}</p>
+                </div>
+                <a href="${item.url}" class="download-button" download>Download</a>
+            </div>
+        `).join('')}
+    </div>
+
+    <div id="fullscreen" class="fullscreen" onclick="closeFullscreen()">
+        <span class="close" onclick="closeFullscreen()">×</span>
+        <img id="fullscreen-image" src="" style="display:none;">
+        <video id="fullscreen-video" src="" controls style="display:none;"></video>
+    </div>
+
+    <form action="/create-folder" method="post">
+        <input type="text" name="folderName" placeholder="New folder name" required>
         <button type="submit">Create Folder</button>
     </form>
-    <div class="gallery">
-        ${media.map(({ url, size, uploadDate }) => {
-            const dateStr = uploadDate instanceof Date ? uploadDate.toDateString() : 'Unknown Date';
-            const isVideo = url.endsWith('.mp4') || url.endsWith('.avi') || url.endsWith('.mov');
-            const fileName = path.basename(url);
-            return `
-            <div class="gallery-item" onclick="openFullscreen('${fileName}')">
-                ${isVideo ? 
-                    `<video src="${url}" controls></video>` : 
-                    `<img src="${url}" alt="Image" />`
-                }
-                <div class="info">Size: ${size} bytes<br>Uploaded: ${dateStr}</div>
-                <a href="${url}" download class="download-button">Download</a>
-            </div>
-            <div id="fullscreen-${fileName}" class="fullscreen">
-                <span class="fullscreen-close" onclick="closeFullscreen()">×</span>
-                ${isVideo ? 
-                    `<video src="${url}" controls autoplay></video>` : 
-                    `<img src="${url}" alt="Image" />`
-                }
-            </div>
-            `;
-        }).join('')}
-    </div>
+
     <script>
-        function openFullscreen(fileName) {
-            document.getElementById('fullscreen-' + fileName).style.display = 'flex';
+        function openFullscreen(url) {
+            const imgElement = document.getElementById('fullscreen-image');
+            const videoElement = document.getElementById('fullscreen-video');
+            if (url.endsWith('.mp4')) {
+                videoElement.src = url;
+                videoElement.style.display = 'block';
+                imgElement.style.display = 'none';
+            } else {
+                imgElement.src = url;
+                imgElement.style.display = 'block';
+                videoElement.style.display = 'none';
+            }
+            document.getElementById('fullscreen').style.display = 'flex';
         }
 
         function closeFullscreen() {
-            document.querySelectorAll('.fullscreen').forEach(element => {
-                element.style.display = 'none';
-            });
+            document.getElementById('fullscreen').style.display = 'none';
+            document.getElementById('fullscreen-image').src = '';
+            document.getElementById('fullscreen-video').src = '';
         }
     </script>
 </body>
 </html>
 `;
-
-// Route to display the gallery
-app.get('/', async (req, res) => {
-    const media = await listMedia();
-    res.send(galleryTemplate(media));
-});
-
-// Route to handle video uploads
-app.post('/upload', ipRestrict, upload.single('video'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
-    res.send('File uploaded successfully.');
-});
-
-// Route to handle folder creation
-app.post('/create-folder', ipRestrict, (req, res) => {
-    const { folderName } = req.body;
-    if (!folderName) {
-        return res.status(400).send('Folder name is required.');
-    }
-
-    const folderPath = path.join(LOCAL_MEDIA_DIR, folderName);
-
-    // Check if folder already exists
-    if (fs.existsSync(folderPath)) {
-        return res.status(400).send('Folder already exists.');
-    }
-
-    // Create the new folder
-    fs.mkdir(folderPath, (err) => {
-        if (err) {
-            console.error(err);
-            return res.status(500).send('Error creating folder.');
-        }
-
-        res.send('Folder created successfully.');
-    });
-});
-
-// Route to serve media files from local directory
-app.use('/local', express.static(LOCAL_MEDIA_DIR));
-
-// Start the server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
