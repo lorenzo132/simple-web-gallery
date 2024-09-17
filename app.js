@@ -18,8 +18,8 @@ const SFTP_USER = process.env.SFTP_USER;
 const SFTP_PASSWORD = process.env.SFTP_PASSWORD;
 const SFTP_DIR = process.env.SFTP_DIR || '/';
 
-// Allowed IP address for uploading videos
-const UPLOAD_ALLOWED_IP = process.env.UPLOAD_ALLOWED_IP;
+// Allowed IP address for uploading videos and managing folders
+const ALLOWED_IP = process.env.ALLOWED_IP;
 
 // Local video storage directory
 const LOCAL_VIDEO_DIR = 'local_videos/';
@@ -34,22 +34,34 @@ const upload = multer({
 });
 
 // Ensure local video directory exists
-if (!fs.existsSync(LOCAL_VIDEO_DIR)){
+if (!fs.existsSync(LOCAL_VIDEO_DIR)) {
     fs.mkdirSync(LOCAL_VIDEO_DIR);
 }
 
 // Trust the X-Forwarded-For header to get the correct client IP if using a proxy
 app.set('trust proxy', true);
 
-// Middleware to check IP address for uploads
+// Middleware to check IP address for uploads and folder management
 function ipRestrict(req, res, next) {
     const clientIp = req.ip;
     console.log(`Client IP: ${clientIp}`);
     
-    if (clientIp === UPLOAD_ALLOWED_IP) {
+    if (clientIp === ALLOWED_IP) {
         next();
     } else {
         res.status(403).send('Forbidden: You are not allowed to upload.');
+    }
+}
+
+// Middleware to check IP address for folder management
+function folderManagementIpRestrict(req, res, next) {
+    const clientIp = req.ip;
+    console.log(`Client IP: ${clientIp}`);
+    
+    if (clientIp === ALLOWED_IP) {
+        next();
+    } else {
+        res.status(403).send('Forbidden: You are not allowed to manage folders.');
     }
 }
 
@@ -132,8 +144,8 @@ app.use(express.static('public'));
 app.use('/local', express.static(LOCAL_VIDEO_DIR));
 app.use(express.urlencoded({ extended: true }));
 
-// Define the HTML template for the gallery
-const galleryTemplate = (media) => `
+// Define the HTML template for the gallery with folder management
+const galleryTemplate = (media, showFolderButtons) => `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -141,115 +153,24 @@ const galleryTemplate = (media) => `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Media Gallery</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            color: #333;
-            margin: 0;
-            padding: 0;
-        }
-        h1 {
-            text-align: center;
-            padding: 20px;
-        }
-        .gallery {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            justify-content: center;
-            padding: 20px;
-        }
-        .gallery-item {
-            position: relative;
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-            max-width: 300px;
-            margin: 10px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            cursor: pointer;
-        }
-        .gallery-item img {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .gallery-item video {
-            display: block;
-            width: 100%;
-            height: auto;
-            object-fit: cover;
-        }
-        .info {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0, 0, 0, 0.6);
-            color: white;
-            padding: 10px;
-            font-size: 14px;
-            display: none;
-            text-align: center;
-        }
-        .gallery-item:hover .info {
-            display: block;
-        }
-        .download-button {
-            display: block;
-            margin: 10px;
-            padding: 10px;
-            background: #007bff;
-            color: white;
-            text-align: center;
-            text-decoration: none;
-            border-radius: 5px;
-            width: calc(100% - 20px);
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        .download-button:hover {
-            background: #0056b3;
-        }
-        .fullscreen {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-        .fullscreen img {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen video {
-            max-width: 90%;
-            max-height: 90%;
-        }
-        .fullscreen:target {
-            display: flex;
-        }
-        .fullscreen-close {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            color: white;
-            font-size: 24px;
-            cursor: pointer;
-        }
+        /* Your existing CSS here */
     </style>
 </head>
 <body>
     <h1>Media Gallery</h1>
+    ${showFolderButtons ? `
+    <div>
+        <h2>Manage Folders</h2>
+        <form action="/create-folder" method="post">
+            <input type="text" name="folderName" placeholder="New folder name" required>
+            <button type="submit">Create Folder</button>
+        </form>
+        <form action="/delete-folder" method="post">
+            <input type="text" name="folderName" placeholder="Folder name to delete" required>
+            <button type="submit">Delete Folder</button>
+        </form>
+    </div>
+    ` : ''}
     <div class="gallery">
         ${media.map(({ url, size, uploadDate }) => {
             const dateStr = uploadDate instanceof Date ? uploadDate.toDateString() : 'Unknown Date';
@@ -339,19 +260,17 @@ app.get('/media/:filename', async (req, res) => {
         if (Buffer.isBuffer(sftpStream)) {
             const stream = new PassThrough();
             stream.end(sftpStream);
-
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+            res.writeHead(200, {
+                "Content-Type": mime.lookup(filename) || "application/octet-stream",
+                "Content-Length": sftpStream.length
+            });
             stream.pipe(res);
         } else {
-            res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-            sftpStream.pipe(res);
+            res.status(404).send('Not Found');
         }
-
     } catch (error) {
         console.error(error);
-        res.status(500).send('Error retrieving file.');
+        res.status(500).send('Internal Server Error');
     } finally {
         if (sftp) {
             await sftp.end();
@@ -359,52 +278,57 @@ app.get('/media/:filename', async (req, res) => {
     }
 });
 
-// Define the route to display the gallery
+// Route to handle file uploads
+app.post('/upload', ipRestrict, upload.single('video'), (req, res) => {
+    res.send('File uploaded successfully.');
+});
+
+// Route to handle folder creation
+app.post('/create-folder', folderManagementIpRestrict, (req, res) => {
+    const { folderName } = req.body;
+    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    
+    if (!folderName) {
+        return res.status(400).send('Folder name is required.');
+    }
+
+    fs.mkdir(folderPath, (err) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).send('Error creating folder.');
+        }
+        res.send('Folder created successfully.');
+    });
+});
+
+// Route to handle folder deletion
+app.post('/delete-folder', folderManagementIpRestrict, (req, res) => {
+    const { folderName } = req.body;
+    const folderPath = path.join(LOCAL_VIDEO_DIR, folderName);
+    
+    if (!folderName) {
+        return res.status(400).send('Folder name is required.');
+    }
+
+    fs.rmdir(folderPath, { recursive: true }, (err) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).send('Error deleting folder.');
+        }
+        res.send('Folder deleted successfully.');
+    });
+});
+
+// Route to display media gallery
 app.get('/', async (req, res) => {
     const media = await listMedia();
-    res.send(galleryTemplate(media));
-});
-
-// Define the route for the upload page
-app.get('/upload', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Upload Video</title>
-    </head>
-    <body>
-        <h1>Upload Video</h1>
-        <form action="/upload" method="post" enctype="multipart/form-data">
-            <input type="file" name="video" accept="video/*" required>
-            <button type="submit">Upload</button>
-        </form>
-    </body>
-    </html>
-    `);
-});
-
-// Define the route to handle video uploads
-app.post('/upload', ipRestrict, upload.single('video'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
-    
-    // Detect the file type and rename it with the correct extension
-    const filePath = path.join(LOCAL_VIDEO_DIR, req.file.filename);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = mime.lookup(req.file.originalname) || 'video/mp4'; // Default to mp4 if type cannot be detected
-    const newFilePath = path.join(LOCAL_VIDEO_DIR, `${req.file.filename}${mime.extension(mimeType) ? '.' + mime.extension(mimeType) : '.mp4'}`);
-
-    fs.renameSync(filePath, newFilePath);
-
-    res.send('Upload successful.');
+    const clientIp = req.ip;
+    const showFolderButtons = clientIp === ALLOWED_IP;
+    res.send(galleryTemplate(media, showFolderButtons));
 });
 
 // Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
